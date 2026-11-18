@@ -1,0 +1,539 @@
+#!/usr/bin/env node
+// Fluent kit visual verification. Opens a page in a real browser and checks it.
+// Usage: node .fluent-kit/scripts/verify.mjs --start /invoices          (starts the dev server itself, checks, stops it)
+//        node .fluent-kit/scripts/verify.mjs http://localhost:3000/invoices   (dev server already running)
+// Options: default 1440 and 375px, light. [--full] (1440, 768 and 375px, light and dark: new pages, shells, overlays)
+//          [--widths 1440,768,375] [--schemes light,dark] [--out .fluent-kit/out] [--wait <css selector>] [--no-axe]   (--quick is accepted and is the default)
+//          [--start] [--cmd "npm run dev"]   --start runs the project's dev script (or --cmd) and waits for its URL; paths like /invoices are
+//                                            then opened on it. Use it from agent terminals, where a long-running server blocks the terminal.
+//          [--storage auth.json]   a Playwright storage state (saved with: npx playwright codegen --save-storage=auth.json <url>) so pages behind a login can be checked.
+//          [--profile .verify-profile]   use the real Microsoft Edge with this profile folder (kept between runs). For apps whose login needs Edge, a work device policy or an SSO extension: sign in once in that Edge profile (see below) and it stays signed in. Add --headed to watch it.
+//          Pages behind a login: when verify lands on a sign-in page it opens a visible Edge on .verify-profile, waits for you to sign in, and checks again. [--no-login] turns that off (it is off in CI).
+//          [--click "role=button[name='New task']"]   after the normal check, click this (several steps separated by ;), then check and screenshot that state too (-open.png).
+//                                            Use it for drawers, dialogs, menus and pickers: the page alone never shows them.
+//          [--setup]   install what verify needs (playwright-core and axe-core) into .fluent-kit/deps, plus Chromium only when
+//                      no Edge or Chrome is on the machine. The project's package.json is not touched. Run it once, as a person.
+//          [--login <url>]   open Edge on .verify-profile at <url> to sign in once, without running a check.
+// Uses Playwright and axe-core from the project if it has them, otherwise from .fluent-kit/deps (see --setup). Writes screenshots plus one contact-sheet.png of every first screen; it names the screenshot to open
+// next to each problem, so look at the contact sheet once and open other files only when a problem points to them.
+// Exit codes: 0 ok (warnings allowed), 1 problems found, 2 could not run (no Playwright, no browser, server or page did not load).
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readlinkSync, rmSync, writeFileSync } from "node:fs";
+import { spawn, spawnSync } from "node:child_process";
+import { dirname, join, resolve } from "node:path";
+import { POPUP_CAP, SETUP_CMD, axeSourcePath, installVerifyDeps, loadPlaywright, packageManager } from "./lib.mjs";
+import { gridProbe, overlapProbe, popupProbe, scrollbarProbe } from "./probes.mjs";
+
+const args = process.argv.slice(2);
+const opt = (n, d) => { const i = args.indexOf(n); return i >= 0 ? args[i + 1] : d; };
+const valueFlags = new Set(["--widths", "--schemes", "--out", "--wait", "--cmd", "--click", "--storage", "--profile", "--login"]);
+if (args.includes("--help") || args.includes("-h")) { console.log(readFileSync(new URL(import.meta.url), "utf8").split("\n").filter((l) => l.startsWith("//")).map((l) => l.replace(/^\/\/ ?/, "")).join("\n")); process.exit(0); }
+if (args.includes("--setup")) process.exit(installVerifyDeps(process.cwd()) ? 0 : 2);
+const loginOnly = args.includes("--login") ? (opt("--login", "") || "http://localhost:3000") : null;
+const startServer = args.includes("--start") || args.includes("--cmd");
+let urls = args.filter((a, i) => !a.startsWith("--") && !valueFlags.has(args[i - 1]));
+if (startServer && !urls.length) urls = ["/"];
+if (!urls.length && !loginOnly) { console.error("Usage: node .fluent-kit/scripts/verify.mjs --start /path   or   node .fluent-kit/scripts/verify.mjs <url>"); process.exit(2); }
+
+// Console errors, shortened. A React hydration error carries a long boilerplate list and then the part that
+// matters (the diff of server vs client markup); keep the first sentence and the diff lines, drop the list.
+// True when every server-side ("-") line of a hydration diff belongs to a tabster helper element.
+function tabsterOnly(e) {
+  if (!/Hydration failed/i.test(e) || !/data-tabster-dummy/.test(e)) return false;
+  const parts = e.split("| diff:")[1];
+  if (!parts) return false;
+  const server = parts.split(" ; ").map((l) => l.trim()).filter((l) => /^-\s/.test(l));
+  const helper = /^-\s+(<i\b|<\/i>|>|tabindex=|role=|data-tabster|aria-hidden=|style=)/;
+  return server.length > 0 && server.every((l) => helper.test(l));
+}
+const rawErrors = [];
+function shortError(text) {
+  rawErrors.push(text);
+  if (/hydrat|didn't match/i.test(text)) {
+    const lines = text.split("\n").map((l) => l.trimEnd());
+    const first = lines[0].replace(/\s+/g, " ").slice(0, 160);
+    const isDelta = (l) => /^\s*[+-] /.test(l) && !/^\s*- (A|Variable|Date|External|Invalid|It) /.test(l);
+    const delta = lines.filter(isDelta).slice(0, 40).map((l) => l.trim().slice(0, 160));
+    const ctx = lines.filter((l) => !isDelta(l) && /^\s*<[A-Za-z]/.test(l)).slice(-4).map((l) => l.trim().slice(0, 120));
+    const diff = delta.length ? [...delta, "context:", ...ctx] : ctx;
+    return diff.length ? `${first} | diff: ${diff.join(" ; ")}` : text.replace(/\s+/g, " ").slice(0, 1200);
+  }
+  if (/Minified React error #(418|423|425)\b/.test(text)) {
+    return text.replace(/\s+/g, " ").slice(0, 200) + " | This is a React hydration mismatch from a production build; the message is stripped, so the element is unknown. Run verify against a dev server (--start) to get the diff. If that diff is only <i data-tabster-dummy>, it is the known Fluent focus-helper issue.";
+  }
+  return text.replace(/\s+/g, " ").slice(0, 600);
+}
+if (!loginOnly && !startServer && urls.some((u) => u.startsWith("/"))) { console.error("A path like /invoices needs --start (to run the dev server) or a full URL like http://localhost:3000/invoices."); process.exit(2); }
+const full = args.includes("--full"); // default is the fast pass (1440 and 375, light); --full adds 768 and dark
+const widths = opt("--widths", full ? "1440,768,375" : "1440,375").split(",").map(Number);
+const schemes = opt("--schemes", full ? "light,dark" : "light").split(",");
+const outDir = resolve(opt("--out", ".fluent-kit/out"));
+const ANSI = new RegExp(String.fromCharCode(27) + "\\[[0-9;]*m", "g"); // terminal colour codes in dev-server output
+// One line per call in verify-runs.jsonl (also calls that stop early), so a benchmark can count how often the agent verified.
+const runLog = { at: new Date().toISOString(), args, renders: 0, errors: null, warnings: null };
+process.on("exit", (code) => {
+  try { mkdirSync(outDir, { recursive: true }); appendFileSync(join(outDir, "verify-runs.jsonl"), JSON.stringify({ ...runLog, exitCode: code, ms: Date.now() - Date.parse(runLog.at) }) + "\n"); } catch { /* never block the exit */ }
+});
+const waitFor = opt("--wait", null);
+const clickSteps = (opt("--click", "") || "").split(";").map((x) => x.trim()).filter(Boolean);
+const useAxe = !args.includes("--no-axe");
+const storagePath = opt("--storage", null);
+let profileDir = opt("--profile", null) ? resolve(opt("--profile")) : (!storagePath && existsSync(resolve(".verify-profile"))) ? resolve(".verify-profile") : null; // a .verify-profile folder in the project is used automatically
+if (profileDir && !opt("--profile", null)) console.log("Using the signed-in Edge profile .verify-profile");
+// On a sign-in page, open a visible Edge so the person can sign in, then check again. Not in CI (no one to sign in).
+const canLogin = !storagePath && !args.includes("--no-login") && !process.env.CI;
+const isSignIn = (title, u) => /sign in|log ?in|inloggen|aanmelden/i.test(title) || /login\.microsoftonline|login\.live/.test(u);
+
+const pw = loadPlaywright(process.cwd())?.pw;
+if (!pw) {
+  console.error(`fluent-kit verify: NOT RUN, Playwright is not set up. Do not install packages yourself and do not retry: say in your reply that the UI was not verified, and that the person can enable the check once with: ${SETUP_CMD}`);
+  process.exit(2);
+}
+// Optionally start the dev server, wait for its URL, and stop it when we are done.
+let server = null;
+// The dev server verify starts is recorded here, so a run an agent's terminal cut off does not leave it on the port.
+const serverFile = resolve(".fluent-kit/out/dev-server.json");
+const killTree = (pid) => { try { if (process.platform === "win32") spawnSync("taskkill", ["/pid", String(pid), "/T", "/F"], { stdio: "ignore" }); else process.kill(-pid); } catch { /* already gone */ } };
+const stopServer = () => {
+  if (!server) return;
+  killTree(server.pid);
+  rmSync(serverFile, { force: true });
+  server = null;
+};
+process.on("exit", stopServer);
+process.on("SIGINT", () => process.exit(130));
+process.on("SIGTERM", () => process.exit(143));
+process.on("SIGHUP", () => process.exit(129));
+if (startServer) {
+  const cwd = process.cwd();
+  let cmd = opt("--cmd", null);
+  if (!cmd) {
+    let dev = null; try { dev = JSON.parse(readFileSync(join(cwd, "package.json"), "utf8")).scripts?.dev; } catch { /* none */ }
+    if (!dev) { console.error("No \"dev\" script in package.json. Pass the command with --cmd \"...\", or start the server yourself and pass a full URL."); process.exit(2); }
+    cmd = { pnpm: "pnpm run dev", yarn: "yarn dev", bun: "bun run dev", npm: "npm run dev" }[packageManager(cwd)];
+    // The agent's shell may not have the package manager the lockfile points to (bun on a Windows PATH, say): fall back to npm, which runs the same "dev" script.
+    const pm = cmd.split(" ")[0];
+    if (pm !== "npm" && spawnSync(pm, ["--version"], { shell: true, stdio: "ignore" }).status !== 0) {
+      if (spawnSync("npm", ["--version"], { shell: true, stdio: "ignore" }).status !== 0) { console.error(`${pm} is not available in this shell, and neither is npm. Start the dev server yourself and pass its full URL, or pass --cmd "<your dev command>". If you cannot verify, say that verification was NOT done.`); process.exit(2); }
+      console.log(`Note: ${pm} is not available in this shell; running the dev script with npm instead.`);
+      cmd = "npm run dev";
+    }
+  }
+  try {
+    const old = JSON.parse(readFileSync(serverFile, "utf8"));
+    if (old.pid && old.cwd === cwd) { killTree(old.pid); console.log(`Stopped the dev server an earlier verify run left running (process ${old.pid}).`); }
+  } catch { /* none left */ }
+  rmSync(serverFile, { force: true });
+  console.log(`Starting dev server: ${cmd}`);
+  let log = "";
+  let exited = false;
+  server = spawn(cmd, { shell: true, cwd, detached: process.platform !== "win32", stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, BROWSER: "none", FORCE_COLOR: "0", NO_COLOR: "1" } });
+  try { mkdirSync(dirname(serverFile), { recursive: true }); writeFileSync(serverFile, JSON.stringify({ pid: server.pid, cwd, at: new Date().toISOString() })); } catch { /* best effort */ }
+  const ready = new Promise((resolveUrl) => {
+    let timer = null, noted = null; // the busy-port note is printed once per URL, not once per chunk of server output
+    const onData = (d) => {
+      log = (log + d.toString()).slice(-4000);
+      const clean = log.replace(ANSI, "");
+      const all = clean.match(/https?:\/\/(?:localhost|127\.0\.0\.1|\[::1\]):\d+/g);
+      if (!all) return;
+      // If the port was busy the server says so and then prints the port it really uses: wait a moment and take the last URL.
+      const busy = /in use|already|trying|instead/i.test(clean);
+      clearTimeout(timer); timer = setTimeout(() => resolveUrl(all[all.length - 1]), busy ? 2500 : 0);
+      if (busy && noted !== all[all.length - 1]) { noted = all[all.length - 1]; console.log("Note: the dev server reported a busy port. Using " + noted + " (another project may be using the default port). Check the heading printed below against the page you asked for before you trust the run."); }
+    };
+    server.stdout.on("data", onData); server.stderr.on("data", onData);
+    server.on("exit", () => {
+      exited = true;
+      // The dev server stopped at once, often because one is already running for this project ("another instance is already running"
+      // and it prints that server's URL). Use that URL instead of failing.
+      const all = log.replace(ANSI, "").match(/https?:\/\/(?:localhost|127\.0\.0\.1|\[::1\]):\d+/g);
+      if (all) { console.log("Note: the dev server did not start a new instance; using the one already running at " + all[all.length - 1] + "."); resolveUrl(all[all.length - 1]); } else resolveUrl(null);
+    });
+    setTimeout(() => resolveUrl(null), 90000);
+  });
+  let base = await ready;
+  if (!base) { console.error(`${exited ? "The dev server exited without printing a localhost URL." : "The dev server did not report a URL within 90 seconds."}\nLast output:\n${log.slice(-800)}\nIf another dev server is already running (the log may say "port in use" or "already running"), pass its full URL instead, for example http://localhost:3000/your-page. Otherwise fix the server error. If you cannot verify, say that verification was NOT done.`); process.exit(2); }
+  // The URL in the server output is not always the one that answers: when a port is busy the server prints several (3001, then 3000), or
+  // another instance is already running. Try the one chosen first, then every other URL it printed, until one responds.
+  const answers = async (u) => { try { await fetch(u, { signal: AbortSignal.timeout(2000) }); return true; } catch { return false; } };
+  let live = null;
+  for (let i = 0; i < 60 && !live; i++) {
+    const seen = [...new Set(log.replace(ANSI, "").match(/https?:\/\/(?:localhost|127\.0\.0\.1|\[::1\]):\d+/g) || [])].reverse();
+    for (const u of [base, ...seen.filter((x) => x !== base)]) if (await answers(u)) { live = u; break; }
+    if (!live) await new Promise((r) => setTimeout(r, 500));
+  }
+  if (!live) { console.error(`The dev server printed ${base} but nothing answered there (or at any other URL it printed) within 30 seconds.\nLast output:\n${log.slice(-600)}\nIf you already have the server running, pass its full URL, for example http://localhost:3000/your-page. If you cannot verify, say that verification was NOT done.`); process.exit(2); }
+  if (live !== base) { console.log(`Note: nothing answered at ${base}; using ${live}, which the dev server also printed.`); base = live; }
+  urls = urls.map((u) => (u.startsWith("/") ? base + u : u));
+  console.log(`Dev server ready at ${base}`);
+}
+let axeSource = null;
+if (useAxe) {
+  const axePath = axeSourcePath(process.cwd());
+  if (axePath) { try { axeSource = readFileSync(axePath, "utf8"); } catch { /* optional */ } }
+}
+
+mkdirSync(outDir, { recursive: true });
+try { writeFileSync(join(outDir, ".gitignore"), "*\n"); } catch { /* ignore */ }
+
+const problems = [];
+// Known app-wide issues the team accepted (for example one in the app shell) can be listed in .fluent-kit/verify-ignore.json as an array of
+// text fragments, such as ["scrollable-region-focusable", "landmark-no-duplicate-main"]. Matching messages are not reported.
+let ignoreList = [];
+try { const f = resolve(".fluent-kit/verify-ignore.json"); if (existsSync(f)) ignoreList = JSON.parse(readFileSync(f, "utf8")).filter((x) => typeof x === "string"); } catch { /* ignore */ }
+const note = (level, where, msg) => { if (ignoreList.some((x) => msg.includes(x))) return; problems.push({ level, where, msg }); };
+const shots = [];
+const shotFor = new Map(); // render label -> the screenshot that shows it
+const firstShots = []; // [label, file] for the contact sheet
+const slug = (u) => u.replace(/^https?:\/\//, "").replace(/[^a-z0-9]+/gi, "-").replace(/^-|-$/g, "").slice(0, 60) || "page";
+
+// Try the bundled Chromium, then Edge, then Chrome already installed on the machine.
+let browser = null;
+const launchErrors = [];
+// Playwright swaps the OS keychain for a mock one (macOS) or a plain store (Linux); then Edge cannot decrypt the cookies a sign-in saved and the profile looks signed out.
+const keychainArgs = ["--use-mock-keychain", "--password-store=basic"];
+const killHint = process.platform === "win32" ? "PowerShell: Get-CimInstance Win32_Process -Filter \"name='msedge.exe'\" | Where-Object CommandLine -match 'verify-profile' | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }" : "pkill -f verify-profile";
+// macOS/Linux: SingletonLock is a symlink to "<host>-<pid>" of the Edge that holds the profile. Returns that pid if it still runs, 0 if the lock is stale.
+function profileLockPid() {
+  let pid;
+  try { pid = Number(readlinkSync(join(profileDir, "SingletonLock")).split("-").pop()); } catch { return null; }
+  if (!pid) return null;
+  try { process.kill(pid, 0); return pid; } catch (e) { return e.code === "EPERM" ? pid : 0; }
+}
+const launchProfile = (o) => pw.chromium.launchPersistentContext(profileDir, { channel: "msedge", headless: !args.includes("--headed"), ignoreDefaultArgs: keychainArgs, ...o });
+const profileBrowser = () => ({ newContext: async (o) => {
+  try { return await launchProfile(o); } catch (e) {
+    let err = e;
+    const pid = /ProcessSingleton/.test(String(e)) && process.platform !== "win32" ? profileLockPid() : null;
+    if (pid === 0) {
+      // Left behind by an Edge that crashed or was killed: remove the lock and try once more.
+      for (const f of ["SingletonLock", "SingletonSocket", "SingletonCookie"]) rmSync(join(profileDir, f), { force: true });
+      try { return await launchProfile(o); } catch (e2) { err = e2; }
+    }
+    if (pid > 0) console.error(`Edge could not start with the profile ${profileDir}: another Edge (process ${pid}) still has it open.` + (process.platform === "darwin" ? "\nOn a Mac, closing the Edge window does not quit Edge: switch to the Edge window the sign-in opened and press Cmd+Q," : "\nClose that Edge window,") + ` or run: kill ${pid}\nThen run verify again.`);
+    else console.error("Edge could not start with the profile " + profileDir + ".\nMost likely an Edge window is still open on that profile: close it (" + killHint + ") and run again.\nIf it still fails, try --headed.\n" + String(err).split("\n")[0]);
+    process.exit(2);
+  }
+}, close: async () => {} });
+if (profileDir) browser = profileBrowser();
+
+// Opens a visible Edge on the project's profile at the page, waits until the person is past the sign-in, and keeps the session there.
+async function interactiveLogin(url) {
+  const dir = profileDir || resolve(".verify-profile");
+  try {
+    const gi = resolve(".gitignore"), cur = existsSync(gi) ? readFileSync(gi, "utf8") : "";
+    if (!cur.split(/\r?\n/).some((l) => /^\/?\.verify-profile\/?$/.test(l.trim()))) appendFileSync(gi, (cur && !cur.endsWith("\n") ? "\n" : "") + ".verify-profile/\n");
+  } catch { console.log("Add .verify-profile/ to your .gitignore: it holds your session."); }
+  console.log(`\nSign-in needed. An Edge window opens at ${url}: sign in until your app shows (answer Yes to "Stay signed in?"). The check then continues by itself. Waiting up to 5 minutes.`);
+  let ctx;
+  try { ctx = await pw.chromium.launchPersistentContext(dir, { channel: "msedge", headless: false, ignoreDefaultArgs: keychainArgs, viewport: null }); }
+  catch (e) { console.log("Could not open Edge to sign in: " + String(e).split("\n")[0]); return false; }
+  const page = ctx.pages()[0] || await ctx.newPage();
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  let inApp = 0;
+  try {
+    await page.goto(url).catch(() => {});
+    // The app can flash its own title before it redirects to the sign-in page: count it as signed in after 3 steady seconds.
+    for (const end = Date.now() + 5 * 60000; Date.now() < end && inApp < 3 && !page.isClosed(); await sleep(1000)) {
+      inApp = page.url().startsWith(new URL(url).origin) && !isSignIn(await page.title().catch(() => "sign in"), page.url()) ? inApp + 1 : 0;
+    }
+    if (inApp >= 3) {
+      console.log("Signed in. If the page needs a tenant, stage or customer with real data, pick it in that window now (it is remembered). The check continues when you close the window, or in 30 seconds.");
+      await Promise.race([page.waitForEvent("close", { timeout: 30000 }).catch(() => {}), ctx.waitForEvent("close", { timeout: 30000 }).catch(() => {})]);
+    }
+  } finally { await ctx.close().catch(() => {}); }
+  if (inApp < 3) { console.log("Sign-in did not finish in time."); return false; }
+  if (!profileDir) { await browser.close().catch(() => {}); profileDir = dir; browser = profileBrowser(); }
+  return true;
+}
+if (loginOnly) {
+  try { await fetch(loginOnly, { signal: AbortSignal.timeout(5000) }); }
+  catch { console.error(`Nothing answers at ${loginOnly}. Start the dev server first, then run: node .fluent-kit/scripts/verify.mjs --login <its URL>`); process.exit(2); }
+  profileDir = profileDir || resolve(".verify-profile");
+  const okLogin = await interactiveLogin(loginOnly);
+  console.log(okLogin ? "Signed in. verify uses this profile from now on." : "Not signed in. Run it again when you are ready.");
+  process.exit(okLogin ? 0 : 2);
+}
+for (const o of profileDir ? [] : [{}, { channel: "msedge" }, { channel: "chrome" }]) {
+  try { browser = await pw.chromium.launch(o); break; } catch (e) { launchErrors.push(String(e).split("\n")[0]); }
+}
+if (!browser) {
+  console.error(`fluent-kit verify: NOT RUN, no browser could start (${(launchErrors[0] || "unknown error").slice(0, 160)}). Do not retry: say in your reply that the UI was not verified. The person fixes it once by installing Microsoft Edge or Google Chrome, or with: ${SETUP_CMD}`);
+  process.exit(2);
+}
+const overlapMsg = (list) => `A control covers text: ${list.join("; ")}. Usually a fixed height or an absolute position that does not fit this width (a stacked Fluent TableCell needs height: "auto").`;
+const scrollMsg = (list) => `Scrolling areas use the browser's default scrollbar: ${list.join("; ")}. Theme it once in the global styles, never per component: context.mjs prints the rule.`;
+const gridMsg = (list) => `Cards in a grid are not one size (${list.join("; ")}). Fixed rows, and the card body scrolls: SKILL.md, "Every page".`;
+const popupMsg = (list) => `An open list is too tall: ${list.join("; ")}. Cap it at 320px so it scrolls. ${POPUP_CAP}`;
+let loaded = 0;
+async function runAxe(page, where) {
+  if (!axeSource) return;
+  try {
+    await page.evaluate(axeSource);
+    const res = await page.evaluate(async () => { const r = await window.axe.run({ exclude: [["[data-tabster-dummy]"]] }, { resultTypes: ["violations"] }); return r.violations.map((v) => ({ id: v.id, impact: v.impact, help: v.help, nodes: v.nodes.length, target: v.nodes[0]?.target?.join(" "), html: (v.nodes[0]?.html || "").replace(/\s+/g, " ").slice(0, 160) })); });
+    for (const v of res) note(v.impact === "critical" || v.impact === "serious" ? "error" : "warn", where, `Accessibility [${v.id}] ${v.help} (${v.nodes} element(s), e.g. ${v.target}${v.html ? ` , html: ${v.html}` : ""})`);
+  } catch (e) { note("warn", where, `axe could not run: ${String(e).split("\n")[0]}`); }
+}
+
+let loginTried = false, retry;
+do {
+retry = false;
+renders: for (const url of urls) {
+  for (const scheme of schemes) {
+    for (const width of widths) {
+      const where = `${url} [${scheme}, ${width}px]`;
+      const ctx = await browser.newContext({ viewport: { width, height: 900 }, colorScheme: scheme, ...(storagePath ? { storageState: storagePath } : {}) });
+      const page = await ctx.newPage();
+      const errors = [];
+      page.on("pageerror", (e) => errors.push(shortError(String(e))));
+      // A missing favicon is the browser's own request, not the page's: reporting it as an error sends the agent after nothing.
+      page.on("console", (m) => { if (m.type() === "error" && !(/Failed to load resource/.test(m.text()) && /\/favicon\.ico(\?|$)/.test(m.location()?.url || ""))) errors.push(shortError(m.text())); });
+      try {
+        await page.goto(url, { waitUntil: "networkidle", timeout: 30000 });
+      } catch (e) {
+        console.error(`Could not open ${url}: ${String(e).split("\n")[0]}\nIs the dev server running?`);
+        await ctx.close(); await browser.close(); process.exit(2);
+      }
+      if (waitFor) { try { await page.waitForSelector(waitFor, { timeout: 10000 }); } catch { note("error", where, `Selector '${waitFor}' never appeared.`); } }
+      await page.waitForTimeout(500);
+      // Do not photograph a loading state: wait until skeletons, spinners and aria-busy regions are gone.
+      try { await page.waitForFunction(() => !document.querySelector(".fui-Skeleton, .fui-Spinner, [aria-busy='true']"), undefined, { timeout: 8000 }); await page.waitForTimeout(200); }
+      catch { note("warn", where, "Still showing a loading state (skeleton, spinner or aria-busy) after 8 seconds, so the screenshots show loading, not content. Use --wait \"<selector of the loaded content>\" or check that the data loads."); }
+      loaded++;
+
+      const pageTitle = await page.title();
+      // The tab title is often fixed in index.html and says nothing about the view: also print the page's own heading and URL.
+      const heading = await page.evaluate(() => (document.querySelector("h1, [role=heading][aria-level='1']") || document.querySelector("h2"))?.textContent?.trim().slice(0, 60) || "");
+      console.log(`  ${where}: heading "${heading}"  (tab title "${pageTitle.slice(0, 40)}")`);
+      if (isSignIn(pageTitle, page.url())) {
+        // Every other finding would be about the identity provider's page, not the app: report only this and stop.
+        const origin = new URL(url).origin;
+        const file = join(outDir, `${slug(url)}-${scheme}-${width}.png`);
+        await page.screenshot({ path: file, timeout: 10000 }).catch(() => {}); // a sign-in page may redirect while it is photographed
+        await ctx.close();
+        if (canLogin && !loginTried) { loginTried = true; if (await interactiveLogin(url)) { retry = true; break renders; } }
+        note("error", where, (profileDir
+          ? `This is a sign-in page, not your app: the Edge profile ${profileDir} is not signed in for ${origin}.`
+          : "This is a sign-in page, not your app.")
+          + ` Nothing was checked and the other renders were skipped; do not change the app because of this run. ${canLogin
+            ? "Run verify again and sign in in the Edge window it opens (answer Yes to \"Stay signed in?\")."
+            : `Sign in once on this machine: node .fluent-kit/scripts/verify.mjs --login ${origin}`}`
+          + " If sign-in itself is refused (company policy), say in your reply that the UI was not verified.");
+        shots.push(file); shotFor.set(where, file); firstShots.push([where, file]);
+        break renders;
+      }
+      const info = await page.evaluate(() => {
+        const prov = document.querySelector(".fui-FluentProvider");
+        const cs = prov ? getComputedStyle(prov) : null;
+        const lum = (rgb) => { const m = (rgb || "").match(/\d+(\.\d+)?/g); if (!m) return null; const [r, g, b] = m.slice(0, 3).map(Number).map((v) => { v /= 255; return v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4); }); return 0.2126 * r + 0.7152 * g + 0.0722 * b; };
+        const stray = [...document.querySelectorAll("button, input, select, textarea, a[href], table, dialog")].filter((el) => !el.closest("[class*='fui-']") && !(el.className && String(el.className).includes("fui-")));
+        const tiny = [...document.querySelectorAll(".fui-Button, .fui-Checkbox, .fui-Switch, .fui-Radio")].filter((el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0 && (r.height < 24 || r.width < 24); }).map((el) => { const r = el.getBoundingClientRect(); return `<${el.tagName.toLowerCase()}> "${(el.textContent || el.getAttribute("aria-label") || "").trim().slice(0, 24)}" ${Math.round(r.width)}x${Math.round(r.height)}px`; });
+        // A link is as tall as its text (Fluent's own size). WCAG 2.5.8 accepts that when its 24px circle touches no other
+        // control or short link, so only crowded links are reported.
+        const hits = [...document.querySelectorAll("a[href], button, input, select, textarea, [role='button'], [role='tab']")];
+        const mid = (q) => [q.x + q.width / 2, q.y + q.height / 2];
+        const tinyLinks = [...document.querySelectorAll(".fui-Link")].filter((el) => { const r = el.getBoundingClientRect(), [cx, cy] = mid(r); return r.width > 0 && r.height < 24 && hits.some((o) => { const q = o.getBoundingClientRect(), [ox, oy] = mid(q); return !o.contains(el) && !el.contains(o) && q.width > 0 && (Math.hypot(Math.max(q.left - cx, 0, cx - q.right), Math.max(q.top - cy, 0, cy - q.bottom)) < 12 || (q.height < 24 && Math.hypot(ox - cx, oy - cy) < 24)); }); }).map((el) => `"${el.textContent.trim().slice(0, 24)}"`);
+        return {
+          provider: !!prov,
+          v8: [...document.querySelectorAll("[class*='ms-']")].some((el) => /(^|\s)ms-[A-Z]/.test(el.getAttribute("class"))),
+          strayV8: stray.filter((el) => { for (let a = el; a; a = a.parentElement) if (/(^|\s)ms-[A-Z]/.test(a.getAttribute("class") || "")) return true; return false; }).length,
+          font: cs?.fontFamily || null,
+          bgLum: lum(cs?.backgroundColor),
+          bodyBgLum: lum(getComputedStyle(document.body).backgroundColor),
+          overflow: document.documentElement.scrollWidth - window.innerWidth,
+          stray: stray.slice(0, 5).map((el) => `<${el.tagName.toLowerCase()}> ${(el.textContent || el.getAttribute("aria-label") || "").trim().slice(0, 30)}`),
+          strayCount: stray.length,
+          tiny, tinyLinks,
+          emptyBody: document.body.innerText.trim().length === 0,
+          // Containers that scroll sideways: on a narrow screen the part that is off-screen can hide the key column.
+          hscroll: window.innerWidth <= 480 ? [...document.querySelectorAll("div, section, main, table")].filter((el) => { const o = getComputedStyle(el); const r = el.getBoundingClientRect(); return /(auto|scroll)/.test(o.overflowX) && el.scrollWidth > el.clientWidth + 1 && r.width > 0 && r.height > 0; }).length : 0,
+          // Space under the last content in the scrolling area: a card that ends flush with the window edge looks cut off.
+          bottomGap: (() => {
+            const se = document.scrollingElement;
+            let c = se, best = se ? se.scrollHeight - se.clientHeight : 0;
+            for (const el of document.querySelectorAll("div, main, section")) { if (!/(auto|scroll)/.test(getComputedStyle(el).overflowY) || el.clientHeight < 0.6 * window.innerHeight) continue; const ex = el.scrollHeight - el.clientHeight; if (ex > best) { best = ex; c = el; } } // page-sized areas only: a card body that scrolls is not the page
+            if (!c || best < 40) return null;
+            const top = c === se ? -c.scrollTop : c.getBoundingClientRect().top - c.scrollTop;
+            let bottom = 0;
+            for (const el of c.querySelectorAll("*")) { const r = el.getBoundingClientRect(); if (!r.width || !r.height) continue; const cs = getComputedStyle(el); if (cs.position === "fixed" || cs.visibility === "hidden") continue;
+              if (r.height >= 0.9 * c.scrollHeight) continue; // a wrapper around the whole page: its bottom padding is the gap being measured
+              bottom = Math.max(bottom, r.bottom - top); }
+            return Math.round(c.scrollHeight - bottom);
+          })(),
+          // Cards that blend in: three or more panels in one row/group that are only a thin outline on the same colour as the page behind them.
+          flatCards: (() => {
+            const bgOf = (el) => { for (let a = el; a; a = a.parentElement) { const c = getComputedStyle(a).backgroundColor; if (c && c !== "rgba(0, 0, 0, 0)" && c !== "transparent") return c; } return "rgb(255, 255, 255)"; };
+            const groups = new Map();
+            for (const el of document.querySelectorAll("div, section, article")) {
+              const r = el.getBoundingClientRect(); if (r.width < 140 || r.height < 60 || r.height > 420 || r.width > window.innerWidth * 0.6) continue;
+              const cs = getComputedStyle(el);
+              if (cs.boxShadow !== "none" || !(parseFloat(cs.borderTopWidth) > 0) || cs.borderTopStyle === "none") continue;
+              if (el.querySelector("input, select, textarea, table, [role=grid], [role=combobox]")) continue;
+              const parent = el.parentElement; if (!parent || !parent.parentElement) continue;
+              if (bgOf(el) !== bgOf(parent)) continue; // different fill from the page behind it: it stands out
+              groups.set(parent, (groups.get(parent) || 0) + 1);
+            }
+            return [...groups.values()].filter((n) => n >= 3).length ? Math.max(...groups.values()) : 0;
+          })(),
+          // First glance: how much reading the first screen asks for, and text blocks that repeat.
+          firstWords: (() => { let n = 0; const w = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT); for (let t = w.nextNode(); t; t = w.nextNode()) { const el = t.parentElement; if (!el || /^(SCRIPT|STYLE|NOSCRIPT)$/.test(el.tagName)) continue; const r = el.getBoundingClientRect(); const cs = getComputedStyle(el); if (!r.width || !r.height || cs.visibility === "hidden" || cs.display === "none" || r.top >= window.innerHeight || r.bottom <= 0) continue; n += (t.textContent.trim().match(/\S+/g) || []).length; } return n; })(),
+          repeated: (() => { const m = new Map(); for (const el of document.querySelectorAll("p, span, div, td, li, pre, code")) { if (el.children.length) continue; const t = (el.textContent || "").replace(/\s+/g, " ").trim(); if (t.length < 70) continue; const r = el.getBoundingClientRect(); if (!r.width || !r.height) continue; m.set(t, (m.get(t) || 0) + 1); } return [...m].filter(([, c]) => c >= 3).slice(0, 2).map(([t, c]) => `"${t.slice(0, 50)}..." x${c}`); })(),
+          // Reading text that runs far across a wide window: lines over about 100 characters are hard to read.
+          longlines: window.innerWidth >= 768 ? [...document.querySelectorAll("p, span, div, code, pre, li, td")].filter((el) => {
+            const own = [...el.childNodes].filter((n) => n.nodeType === 3).map((n) => n.textContent).join("").trim();
+            if (own.length < 100) return false;
+            const r = el.getBoundingClientRect(); if (!r.width || !r.height) return false;
+            const cs = getComputedStyle(el); const mono = /mono|consolas|courier/i.test(cs.fontFamily);
+            return r.width / (parseFloat(cs.fontSize) * (mono ? 0.6 : 0.5)) > 100;
+          }).slice(0, 3).map((el) => `"${(el.textContent || "").trim().slice(0, 28)}..." (${Math.round(el.getBoundingClientRect().width)}px wide)`) : [],
+          // Controls or headings cut off by a container with overflow hidden (content you cannot reach).
+          // Tabs and table cells count too, and so does text that overflows its own box inside a card (a narrow KPI card).
+          clipped: [...document.querySelectorAll(".fui-Button, .fui-Link, .fui-Input, .fui-Tab, h1, h2, h3, .fui-Text, td, th")].filter((el) => {
+            const b = el.getBoundingClientRect(), r = { left: b.left, width: b.width, height: b.height, right: Math.max(b.right, b.left + el.scrollWidth) };
+            if (!r.width || !r.height) return false;
+            if (r.right <= 0 || r.left >= window.innerWidth) return false; // fully off screen on purpose (a closed drawer), not cut off
+            const own = getComputedStyle(el);
+            if (el.scrollWidth > el.clientWidth + 1 && /(hidden|clip)/.test(own.overflowX) && own.textOverflow !== "ellipsis") return true;
+            for (let a = el.parentElement; a && a !== document.documentElement; a = a.parentElement) {
+              const o = getComputedStyle(a);
+              if (/(auto|scroll)/.test(o.overflowX)) return false;
+              if (/(hidden|clip)/.test(o.overflowX)) { const ar = a.getBoundingClientRect(); if (r.right > ar.right + 1 || r.left < ar.left - 1) return true; }
+            }
+            return false;
+          }).slice(0, 4).map((el) => `<${el.tagName.toLowerCase()}> ${(el.textContent || el.getAttribute("aria-label") || "").trim().slice(0, 24)}`),
+        };
+      });
+      // An app that crashes on load shows an empty page, so every other check would only repeat the crash: report the crash alone.
+      const crashed = info.emptyBody && errors.length > 0;
+      if (crashed) note("error", where, `The app crashed on load (the page is empty). Fix this console error first; nothing else was checked: ${[...new Set(errors)].slice(0, 2).join(" | ")}`);
+      else {
+      if (!info.provider && info.v8) note("warn", where, "This page is Fluent UI v8 (ms- classes) with no v9 FluentProvider. Expected until a v8-to-v9 migration starts; do not convert the app unless asked. Migrating: tasks/migrate-v8.md (its first step puts the v9 FluentProvider around the v8 ThemeProvider). Otherwise, never mix v8 and v9 in new code without asking.");
+      else if (!info.provider) note("error", where, "No FluentProvider on the page. Fluent components will be unstyled. Wrap the app in FluentProvider with the project theme.");
+      if (info.provider && info.font && !/Segoe UI/i.test(info.font)) note("warn", where, `Page font is '${info.font.slice(0, 50)}', not Segoe UI. Use the theme's font (tokens.fontFamilyBase).`);
+      if (info.overflow > 1) note("error", where, `Page scrolls sideways (${info.overflow}px wider than the window). Fix the layout for this width.`);
+      if (info.longlines.length) note("advice", where, `Text lines are too long to read comfortably (over about 100 characters across): ${info.longlines.join("; ")}. Cap the text width (max-width around 70 to 80ch, tokens for spacing) and let the card or page be wider than the text.`);
+      if (info.clipped.length) note("error", where, `Content is cut off by its container: ${info.clipped.join("; ")}. Let it wrap or move it into an overflow menu at this width.`);
+      if (info.hscroll) note("warn", where, `${info.hscroll} container(s) scroll sideways at this width. Check that the identifying column and the status stay on screen (hide or move less important columns, or use a list).`);
+      if (info.emptyBody) note("error", where, "The page is empty.");
+      if (info.bottomGap !== null && info.bottomGap < 8) note("advice", where, `The last content ends ${Math.max(info.bottomGap, 0)}px from the bottom of the scrolling area, so cards look cut off at the end. Add space below the page content (padding-bottom: tokens.spacingVerticalXL, or the page wrapper's bottom padding).`);
+      if (info.flatCards) note("advice", where, `${info.flatCards} cards in a row are only a thin outline on the same colour as the page, so they blend in. Put the page area on tokens.colorNeutralBackground2 and the cards on tokens.colorNeutralBackground1 with tokens.shadow4 and tokens.borderRadiusXLarge (8px), see the skill's SKILL.md, "Every page".`);
+      if (info.firstWords > 220) note("advice", where, `The first screen holds about ${info.firstWords} words. Someone should grasp the page in five seconds: put a one-line verdict and the key numbers first, and move detail behind a click or below the fold.`);
+      if (info.repeated.length) note("advice", where, `The same long text appears 3 or more times: ${info.repeated.join("; ")}. In one table or list, group repeats and show the text once with the names it applies to. If each item is its own card, repeats are fine: keep them clamped (about 3 lines) with "Show more".`);
+      if (info.strayCount) note("warn", where, `${info.strayCount} control(s) are not Fluent v9 components${info.strayV8 ? ` (${info.strayV8} of them Fluent v8)` : ""}: ${info.stray.join("; ")}`);
+      if (info.tiny.length) note("warn", where, `${info.tiny.length} Fluent control(s) smaller than 24px: ${info.tiny.slice(0, 4).join("; ")}. Make them at least 24px (32px on touch) or use a larger size.`);
+      if (info.tinyLinks.length) note("warn", where, `${info.tinyLinks.length} link(s) shorter than 24px crowd another control: ${info.tinyLinks.slice(0, 3).join(", ")}. Space them apart, or use a Button.`);
+      if (scheme === "dark" && info.bgLum !== null && info.bgLum > 0.5) note("advice", where, "The browser asks for dark mode but the app stayed light. Fine if the app has a manual theme switch; otherwise follow the system scheme.");
+      // Fluent's focus helper (tabster) can insert hidden <i data-tabster-dummy> elements before React hydrates a
+      // page chunk. React then reports a mismatch whose only server-side difference is those helpers. It is a known
+      // Fluent + Next.js timing issue, not a mistake in the page, so it is a warning, not an error.
+      const isTabsterOnly = tabsterOnly;
+      // Each render opens the signed-in profile afresh, so MSAL can still be finishing a silent sign-in when the app starts another one.
+      const isMsalRace = (e) => /interaction_in_progress/.test(e);
+      const real = errors.filter((e) => !isTabsterOnly(e) && !isMsalRace(e));
+      const tab = errors.filter(isTabsterOnly);
+      if (real.length) note("error", where, `Console errors: ${[...new Set(real)].slice(0, 3).join(" | ")}`);
+      if (errors.some(isMsalRace)) note("warn", where, "MSAL reported interaction_in_progress: the app started a sign-in while another was still running. Not caused by a UI change; do not chase it in this task. (App fix, separately: only call loginRedirect/acquireTokenRedirect when inProgress === InteractionStatus.None.)");
+      const overlaps = await page.evaluate(overlapProbe).catch(() => []);
+      if (overlaps.length) note("warn", where, overlapMsg(overlaps));
+      const grids = await page.evaluate(gridProbe).catch(() => []);
+      if (grids.length) note("warn", where, gridMsg(grids));
+      const tall = await page.evaluate(popupProbe).catch(() => []);
+      if (tall.length) note("warn", where, popupMsg(tall));
+      const bars = await page.evaluate(scrollbarProbe).catch(() => []);
+      if (bars.length) note("warn", where, scrollMsg(bars));
+      if (tab.length) note("warn", where, "Hydration warning caused only by Fluent's tabster focus helpers (<i data-tabster-dummy>) inserted before React hydrated. Known Fluent + Next.js timing issue, not caused by this page; do not rewrite the page for it. Confirm it also appears (or not) in a production build before spending time on it.");
+      }
+
+      if (!crashed) await runAxe(page, where);
+
+      const file = join(outDir, `${slug(url)}-${scheme}-${width}.png`);
+      const firstFile = file.replace(/\.png$/, "-first.png");
+      await page.screenshot({ path: firstFile });
+      // Apps with their own scrolling area (a fixed shell with a scrolling <main>) make a "full page" screenshot show only the first screen.
+      // Grow the window to the height of the biggest scrolling area so the whole page is in the picture.
+      try {
+        const extra = await page.evaluate(() => { let best = 0; for (const el of document.querySelectorAll("div, main, section")) { const o = getComputedStyle(el).overflowY; if (/(auto|scroll)/.test(o) && el.clientHeight >= 0.6 * window.innerHeight && el.scrollHeight > el.clientHeight + 40) best = Math.max(best, el.scrollHeight - el.clientHeight); } return best; });
+        if (extra > 0) { await page.setViewportSize({ width, height: Math.min(900 + extra, 7000) }); await page.waitForTimeout(400); }
+      } catch { /* screenshot as is */ }
+      await page.screenshot({ path: file, fullPage: true });
+      shots.push(file, firstFile);
+      shotFor.set(where, firstFile); // the first screen is readable; a full-page shot of a long page shrinks to illegible
+      if (scheme === schemes[0]) firstShots.push([where, firstFile]); // the sheet shows one scheme; problems in others still name their file
+      // --click: open what is behind a button (drawer, dialog, menu, picker) and check that state too.
+      if (clickSteps.length) {
+        let opened = true;
+        for (const step of clickSteps) {
+          try { await page.locator(step).first().click({ timeout: 5000 }); await page.waitForTimeout(600); }
+          catch { note("error", where, `--click '${step}' could not be clicked within 5 seconds (not on the page, covered, or disabled: a button that needs a selected row stays disabled until you add that click first, for example --click "role=checkbox[name='Row 1'];role=button[name='Delete']"). Use a Playwright selector such as "role=button[name='New task']" or "text=New task".`); opened = false; break; }
+        }
+        if (opened) {
+          shotFor.set(`${where} after clicking ${clickSteps.join(" then ")}`, file.replace(/\.png$/, "-open.png"));
+          await runAxe(page, `${where} after clicking ${clickSteps.join(" then ")}`);
+          const openOverlaps = await page.evaluate(overlapProbe).catch(() => []);
+          if (openOverlaps.length) note("warn", `${where} after clicking ${clickSteps.join(" then ")}`, overlapMsg(openOverlaps));
+          const openTall = await page.evaluate(popupProbe).catch(() => []);
+          if (openTall.length) note("warn", `${where} after clicking ${clickSteps.join(" then ")}`, popupMsg(openTall));
+          const openBars = await page.evaluate(scrollbarProbe).catch(() => []);
+          if (openBars.length) note("warn", `${where} after clicking ${clickSteps.join(" then ")}`, scrollMsg(openBars));
+          await page.screenshot({ path: file.replace(/\.png$/, "-open.png") });
+          shots.push(file.replace(/\.png$/, "-open.png"));
+          if (scheme === schemes[0]) firstShots.push([`${where} after click`, file.replace(/\.png$/, "-open.png")]);
+        }
+      }
+      await ctx.close();
+    }
+  }
+}
+if (retry) { problems.length = 0; shots.length = 0; shotFor.clear(); firstShots.length = 0; rawErrors.length = 0; loaded = 0; console.log("Checking again, signed in:"); }
+} while (retry);
+// One contact sheet of every first screen, so one image shows all renders.
+let sheet = null;
+if (firstShots.length) {
+  try {
+    const tiles = firstShots.map(([label, f]) => `<figure><img src="data:image/png;base64,${readFileSync(f).toString("base64")}"><figcaption>${label.replace(/[<>&]/g, "")}</figcaption></figure>`).join("");
+    const ctx = await browser.newContext({ viewport: { width: 1600, height: 900 } });
+    const pg = await ctx.newPage();
+    await pg.setContent(`<style>body{margin:0;padding:8px;font:12px sans-serif;background:#ddd}main{display:inline-flex;flex-wrap:wrap;max-width:1584px;gap:8px;align-items:flex-start}figure{margin:0}img{height:${firstShots.length > 2 ? 480 : 560}px;display:block;border:1px solid #999}</style><main>${tiles}</main>`);
+    sheet = join(outDir, "contact-sheet.png");
+    await (await pg.$("main")).screenshot({ path: sheet });
+    await ctx.close();
+  } catch { sheet = null; }
+}
+await browser.close();
+
+if (!axeSource && useAxe) problems.push({ level: "warn", where: "setup", msg: `axe-core is not installed, so accessibility was not checked. Do not install it yourself; the person can run: ${SETUP_CMD}` });
+// Same problem at several widths or schemes is reported once, with the list of places and the screenshot to open.
+const groups = new Map();
+for (const p of problems) {
+  const k = p.level + "|" + p.msg;
+  if (!groups.has(k)) groups.set(k, { level: p.level, msg: p.msg, where: [] });
+  groups.get(k).where.push(p.where);
+}
+const all = [...groups.values()];
+const uniq = all.filter((g) => g.level !== "advice");
+const advice = all.filter((g) => g.level === "advice");
+const placeOf = (g) => (g.where.length > 3 ? `${g.where.length} checks across ${loaded} renders` : g.where.join(", "));
+for (const g of uniq) {
+  const shot = g.where.map((x) => shotFor.get(x)).find(Boolean);
+  console.log(`${g.level === "error" ? "ERROR" : "warn "}  ${g.msg}\n       at: ${placeOf(g)}${shot ? `\n       open: ${shot}` : ""}`);
+}
+if (advice.length) {
+  console.log("\nAdvisory (judgement calls: change them only if they are part of what you were asked; otherwise name them in your note. Never re-run verify for these):");
+  for (const g of advice) console.log(`  - ${g.msg} (${placeOf(g)})`);
+}
+const errs = uniq.filter((p) => p.level === "error").length;
+Object.assign(runLog, { renders: loaded, errors: errs, warnings: uniq.length - errs, advisory: advice.length, kinds: uniq.map((g) => g.msg.replace(/\d+/g, "N").slice(0, 60)) }); // kinds: for doctor --report
+try { writeFileSync(join(outDir, "verify-report.json"), JSON.stringify({ at: runLog.at, args, renders: loaded, errors: errs, warnings: uniq.length - errs, advisory: advice.length, problems: all, contactSheet: sheet, screenshots: shots }, null, 2) + "\n"); } catch { /* report is optional */ }
+console.log(`\nfluent-kit verify: ${loaded} renders, ${errs} error(s) (must fix), ${uniq.length - errs} warning(s) (fix if your change caused them, otherwise mention them)${advice.length ? `, ${advice.length} advisory` : ""}.`);
+if (sheet) console.log(`Look once at ${sheet} (every first screen and opened state in one image). Open another screenshot only where a problem above says "open:". All files: ${outDir}`);
+else console.log(`Screenshots: ${outDir}. Open the 1440px *-first.png once, and other files only where a problem above says "open:".`);
+console.log(`Critique, once, from the contact sheet (change the page only where an answer is no and the fix is within what was asked):
+  1. Five seconds: what is this page, is anything wrong, what do I do next?
+  2. Squint: is the main thing still obvious, with a clear second level?
+  3. Stranger: does every label make sense without knowing the code?
+  4. Same as the rest: does it match the nearest existing page (cards, header, spacing, wording)?`);
+if (rawErrors.length) {
+  mkdirSync(outDir, { recursive: true });
+  writeFileSync(join(outDir, "console-errors.txt"), [...new Set(rawErrors)].join("\n\n----\n\n"));
+  console.log(`Full console errors (unshortened): ${join(outDir, "console-errors.txt")}`);
+}
+process.exit(errs ? 1 : 0);

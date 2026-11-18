@@ -1,0 +1,14 @@
+{
+  "note": "Existing findings tolerated by check.mjs. Fix them over time; new ones fail.",
+  "counts": {
+    "src/App.tsx::hardcoded-spacing": 1,
+    "src/pages/ActivityLog.tsx::hardcoded-spacing": 5,
+    "src/pages/ActivityLog.tsx::native-control": 12,
+    "src/pages/Billing.tsx::hardcoded-spacing": 3,
+    "src/pages/Home.tsx::hardcoded-spacing": 6,
+    "src/pages/Home.tsx::hardcoded-color": 4,
+    "src/pages/Home.tsx::native-control": 7,
+    "src/pages/Tenants.tsx::hardcoded-spacing": 4,
+    "src/pages/Tenants.tsx::hardcoded-color": 1
+  }
+}

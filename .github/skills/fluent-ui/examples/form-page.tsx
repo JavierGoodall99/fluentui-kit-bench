@@ -1,0 +1,88 @@
+// Form page skeleton: one 480px column, sections, labels above inputs, Discard then Save. Rules and measurements: patterns/form.md.
+// UI text: use the project's language.
+import {
+  Button,
+  Checkbox,
+  Dropdown,
+  Field,
+  Input,
+  Option,
+  Radio,
+  RadioGroup,
+  Switch,
+  Text,
+  makeStyles,
+  tokens,
+} from "@fluentui/react-components";
+import { useState } from "react";
+
+// Teams come from the app's data; a long list gets a capped, scrolling popup (SKILL.md, "Every page").
+const TEAMS = ["Platform", "Support", "Sales", "Finance", "Legal", "Marketing", "Operations", "People", "Security", "Data", "Design", "Research"];
+
+const useStyles = makeStyles({
+  page: { display: "flex", flexDirection: "column", alignItems: "center", minHeight: "100%", backgroundColor: tokens.colorNeutralBackground2, padding: `${tokens.spacingVerticalXL} ${tokens.spacingHorizontalXL} 0` },
+  column: { display: "flex", flexDirection: "column", width: "100%", maxWidth: "480px", flexGrow: 1, rowGap: tokens.spacingVerticalXL },
+  header: { display: "flex", flexDirection: "column", rowGap: tokens.spacingVerticalXS },
+  title: { margin: 0 },
+  description: { color: tokens.colorNeutralForeground3 },
+  section: { display: "flex", flexDirection: "column", rowGap: tokens.spacingVerticalM },
+  sectionHeader: { display: "flex", flexDirection: "column", rowGap: tokens.spacingVerticalXS },
+  listbox: { maxHeight: "320px" },
+  row: { display: "grid", gridTemplateColumns: "1fr 1fr", columnGap: tokens.spacingHorizontalM, "@media (max-width: 640px)": { gridTemplateColumns: "1fr", rowGap: tokens.spacingVerticalM } },
+  footer: { position: "sticky", bottom: 0, display: "flex", justifyContent: "flex-end", columnGap: tokens.spacingHorizontalS, padding: `${tokens.spacingVerticalM} 0 ${tokens.spacingVerticalXL}`, borderTop: `${tokens.strokeWidthThin} solid ${tokens.colorNeutralStroke2}`, backgroundColor: tokens.colorNeutralBackground2 },
+});
+
+export function FormPage() {
+  const s = useStyles();
+  const [name, setName] = useState("");
+  const [touched, setTouched] = useState(false);
+  const nameError = touched && name.trim() === "" ? "Enter a name." : undefined;
+  return (
+    <form className={s.page} onSubmit={(e) => { e.preventDefault(); setTouched(true); }} noValidate>
+      <div className={s.column}>
+        <div className={s.header}>
+          <Text as="h1" size={600} weight="semibold" className={s.title}>Project settings</Text>
+          <Text className={s.description}>Changes apply to everyone who works on this project.</Text>
+        </div>
+
+        <section className={s.section} aria-labelledby="general">
+          <div className={s.sectionHeader}>
+            <Text id="general" size={200} weight="semibold">General</Text>
+            <Text className={s.description}>Name and ownership.</Text>
+          </div>
+          <div className={s.row}>
+            <Field label="Project name" size="small" required validationMessage={nameError} validationState={nameError ? "error" : "none"}>
+              <Input appearance="filled-lighter" value={name} onChange={(_, d) => setName(d.value)} onBlur={() => setTouched(true)} />
+            </Field>
+            <Field label="Team" size="small">
+              <Dropdown appearance="filled-lighter" defaultValue="Platform" defaultSelectedOptions={["Platform"]} positioning={{ autoSize: false }} listbox={{ className: s.listbox }}>
+                {TEAMS.map((team) => <Option key={team}>{team}</Option>)}
+              </Dropdown>
+            </Field>
+          </div>
+        </section>
+
+        <section className={s.section} aria-labelledby="notify">
+          <div className={s.sectionHeader}>
+            <Text id="notify" size={200} weight="semibold">Notifications</Text>
+            <Text className={s.description}>Choose how people hear about changes.</Text>
+          </div>
+          <Switch label="Send email notifications" defaultChecked />
+          <Switch label="Send desktop notifications" />
+          <Field label="Digest frequency" size="small">
+            <RadioGroup defaultValue="daily">
+              <Radio value="daily" label="Daily" />
+              <Radio value="weekly" label="Weekly" />
+            </RadioGroup>
+          </Field>
+          <Checkbox label="Include archived items in the digest" />
+        </section>
+
+        <div className={s.footer}>
+          <Button type="reset" onClick={() => { setName(""); setTouched(false); }}>Discard</Button>
+          <Button type="submit" appearance="primary">Save</Button>
+        </div>
+      </div>
+    </form>
+  );
+}
