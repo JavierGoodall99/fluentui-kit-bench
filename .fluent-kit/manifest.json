@@ -2,7 +2,7 @@
   "note": "Files installed by fluent-kit. The installer uses this list to remove files a newer kit no longer ships.",
   "kit": {
     "version": "1.9.3",
-    "commit": "74626f0",
+    "commit": "0ff2d31",
     "fingerprint": "453aab049e01"
   },
   "skill": ".github/skills/fluent-ui",
