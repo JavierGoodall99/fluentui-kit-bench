@@ -2,8 +2,8 @@
   "note": "Files installed by fluent-kit. The installer uses this list to remove files a newer kit no longer ships.",
   "kit": {
     "version": "1.9.3",
-    "commit": "b906351",
-    "fingerprint": "6b5afb221ed4"
+    "commit": "bdd5344",
+    "fingerprint": "be12e5f8629a"
   },
   "skill": ".github/skills/fluent-ui",
   "files": [
@@ -27,6 +27,7 @@
     ".github/skills/fluent-ui/SKILL.md",
     ".github/skills/fluent-ui/deviations.md",
     ".github/skills/fluent-ui/examples/app-nav.tsx",
+    ".github/skills/fluent-ui/examples/command-bar.tsx",
     ".github/skills/fluent-ui/examples/confirm-dialog.tsx",
     ".github/skills/fluent-ui/examples/dashboard.tsx",
     ".github/skills/fluent-ui/examples/data-card.tsx",
